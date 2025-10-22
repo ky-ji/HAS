@@ -111,19 +111,17 @@ class GridBasedHashTable_AdamsBashforth:
     
     def query(self, current_timestep):
         """
-        使用拉格朗日插值公式预测当前特征
-        
-        公式：x(t) = (jk/(i-j)(i-k))·Xi + (ik/(j-i)(j-k))·Xj + (ij/(k-i)(k-j))·Xk
-        
-        其中：
-        - i, j, k 是历史时间步
-        - Xi, Xj, Xk 是对应的历史特征
-        - t 是当前时间步
+        基于多个历史特征的加权AB预测
         
         策略：
-        - 1个历史点：直接返回
-        - 2个历史点：线性插值（一阶拉格朗日）
-        - 3+个历史点：二次插值（二阶拉格朗日，使用最近3个点）
+        1. 对每个历史特征进行AB多步法预测
+        2. 对所有预测结果进行加权融合
+        3. 较新的历史点权重更大
+        
+        优化点：
+        - 提前stack所有导数和特征
+        - 减少循环中的重复操作
+        - 缓存系数的dtype转换
         """
         if len(self.hash_table) == 0:
             return None
@@ -137,51 +135,84 @@ class GridBasedHashTable_AdamsBashforth:
         # 提前stack所有特征为tensor
         features_tensor = torch.stack(features)  # [num_history, *feature_shape]
         dtype = features_tensor.dtype
-        t = current_timestep
         
-        if num_history == 2:
-            # ===== 线性插值（一阶拉格朗日）=====
-            # x(t) = [(t-j)/(i-j)]·Xi + [(t-i)/(j-i)]·Xj
-            i, j = timesteps[0], timesteps[1]
-            Xi, Xj = features_tensor[0], features_tensor[1]
+        # 获取所有历史导数
+        derivatives = self._get_derivatives(timesteps, features)
+
+        if len(derivatives) == 0:
+            return features[-1]
+        
+        # 提前stack所有导数为tensor
+        derivatives_tensor = torch.stack(derivatives)  # [num_history, *feature_shape]
+        
+        # 预分配predictions列表
+        predictions = []
+        
+        # 对每个历史特征进行AB预测
+        for i in range(num_history):
+            dt_i = current_timestep - timesteps[i]
             
-            if i == j:  # 避免除零
-                return Xj
+            if dt_i == 0:
+                predictions.append(features_tensor[i])
+                continue
             
-            # 拉格朗日一阶插值
-            coeff_i = (t - j) / (i - j)
-            coeff_j = (t - i) / (j - i)
+            # 使用张量切片
+            available_derivs = derivatives_tensor[:i+1]  # [i+1, *feature_shape]
+            order = min(i+1, 4)
             
-            result = coeff_i * Xi + coeff_j * Xj
+            # 获取AB系数（带dtype缓存）
+            coeffs_cache_key = (order, dtype)
+            if coeffs_cache_key not in self.ab_coeffs_cache:
+                coeffs = self.ab_coeffs[order].to(dtype=dtype)
+                self.ab_coeffs_cache[coeffs_cache_key] = coeffs
+            else:
+                coeffs = self.ab_coeffs_cache[coeffs_cache_key]
             
+            # 取最近的order个导数并反转
+            recent_derivs = available_derivs[-order:]  # [order, *feature_shape]
+            recent_derivs = torch.flip(recent_derivs, dims=[0])  # 反转顺序
+            
+            # 批量计算：f_pred = f_i + dt_i * sum(coeffs * derivs)
+            coeff_shape = [order] + [1] * (recent_derivs.ndim - 1)
+            coeffs_expanded = coeffs.view(coeff_shape)  # [order, 1, 1, ...]
+            
+            # 批量乘法和求和
+            deriv_contribution = (dt_i * coeffs_expanded * recent_derivs).sum(dim=0)
+            
+            f_pred_i = features_tensor[i] + deriv_contribution
+            predictions.append(f_pred_i)
+
+        # 对所有预测结果进行加权融合
+        # 获取或创建缓存的权重tensor
+        cache_key = (num_history, dtype)
+        
+        if cache_key not in self.fusion_weights_cache:
+            # 第一次使用，创建并缓存
+            if num_history == 2:
+                weights = torch.tensor([0.3, 0.7], dtype=dtype, device=self.device)
+            elif num_history == 3:
+                weights = torch.tensor([0.2, 0.30, 0.5], dtype=dtype, device=self.device)
+            elif num_history == 4:
+                weights = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=dtype, device=self.device)
+            else:
+                weights = torch.linspace(0.1, 0.9, num_history, dtype=dtype, device=self.device)
+                weights = weights / weights.sum()
+            
+            self.fusion_weights_cache[cache_key] = weights
         else:
-            # ===== 二次插值（二阶拉格朗日，使用最近3个点）=====
-            # x(t) = (jk/(i-j)(i-k))·Xi + (ik/(j-i)(j-k))·Xj + (ij/(k-i)(k-j))·Xk
-            
-            # 使用最近的3个历史点
-            i, j, k = timesteps[-3], timesteps[-2], timesteps[-1]
-            Xi, Xj, Xk = features_tensor[-3], features_tensor[-2], features_tensor[-1]
-            
-            # 检查时间步是否不同（避免除零）
-            if i == j or i == k or j == k:
-                # 如果有重复时间步，退化为线性插值或直接返回
-                return Xk
-            
-            # 计算拉格朗日插值系数
-            # 注意：图片中的公式是 jk/(i-j)(i-k)，这里 jk 表示 j*k
-            coeff_i = (j * k) / ((i - j) * (i - k))
-            coeff_j = (i * k) / ((j - i) * (j - k))
-            coeff_k = (i * j) / ((k - i) * (k - j))
-            
-            # 拉格朗日二次插值
-            result = coeff_i * Xi + coeff_j * Xj + coeff_k * Xk
+            weights = self.fusion_weights_cache[cache_key]
+
+        # 加权求和
+        predictions_tensor = torch.stack(predictions)  # [num_history, *feature_shape]
+        weight_shape = [num_history] + [1] * (predictions_tensor.ndim - 1)
+        final_pred = (predictions_tensor * weights.view(weight_shape)).sum(dim=0)
         
-        return result
+        return final_pred
     
     def has(self) -> bool:
         return len(self.hash_table) > 0
     
     def clear(self):
-        self.hash_table.clear()
+        self.has_table.clear()
 
 

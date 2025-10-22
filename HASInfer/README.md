@@ -144,7 +144,6 @@ python HASInfer/scripts/eval_hash_diffusion_policy.py \
 哈希表实现，支持：
 - **历史队列管理**：自动维护固定长度的历史记录
 - **多步法系数缓存**：预计算并缓存 AB/ABM/BDF 系数
-- **拉格朗日插值**：线性和二次插值提高预测精度
 - **设备优化**：自动管理 GPU/CPU 数据传输
 
 ### 参数说明
